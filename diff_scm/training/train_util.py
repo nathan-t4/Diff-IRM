@@ -44,7 +44,7 @@ class TrainLoop:
             schedule_sampler=None,
             weight_decay=0.0,
             lr_anneal_steps=0,
-            main_data_indentifier: str = "image",
+            main_data_identifier: str = "image",
             cond_dropout_rate: float = 0.0,
             conditioning_variable: str = "y",
             iterations: int = 70e3,
@@ -69,7 +69,7 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
-        self.main_data_indentifier = main_data_indentifier
+        self.main_data_identifier = main_data_identifier
         self.conditioning_variable = conditioning_variable
         self.cond_dropout_rate = cond_dropout_rate
         self.iterations = iterations
@@ -208,8 +208,8 @@ class TrainLoop:
 
     def forward_backward(self, data_dict, phase: str = "train"):
         
-        # self.main_data_indentifier = "image"
-        batch = data_dict.pop(self.main_data_indentifier)
+        # self.main_data_identifier = "image"
+        batch = data_dict.pop(self.main_data_identifier)
         model_conditionals = data_dict
 
         assert phase in ["train", "val"]
@@ -297,7 +297,170 @@ class TrainLoop:
 
         dist.barrier()
 
+class IRMTrainLoop(TrainLoop):
+    def __init__(
+            self,
+            *,
+            model,
+            diffusion,
+            data,
+            data_val,
+            batch_size,
+            microbatch,
+            lr,
+            ema_rate,
+            log_interval,
+            save_interval,
+            resume_checkpoint,
+            use_fp16=False,
+            fp16_scale_growth=1e-3,
+            schedule_sampler=None,
+            weight_decay=0.0,
+            lr_anneal_steps=0,
+            main_data_identifier: str = "image",
+            cond_dropout_rate: float = 0.0,
+            conditioning_variable: str = "y",
+            iterations: int = 70e3,
+    ):
+        self.model = model
+        self.diffusion = diffusion
+        self.data = data # TODO: Need to change
+        self.data_val = data_val
+        self.batch_size = batch_size
+        self.microbatch = microbatch if microbatch > 0 else batch_size
+        self.lr = lr
+        self.ema_rate = (
+            [ema_rate]
+            if isinstance(ema_rate, float)
+            else [float(x) for x in ema_rate.split(",")]
+        )
+        self.log_interval = log_interval
+        self.save_interval = save_interval
+        self.resume_checkpoint = resume_checkpoint
+        self.use_fp16 = use_fp16
+        self.fp16_scale_growth = fp16_scale_growth
+        self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
+        self.weight_decay = weight_decay
+        self.lr_anneal_steps = lr_anneal_steps
+        self.main_data_identifier = main_data_identifier
+        self.conditioning_variable = conditioning_variable
+        self.cond_dropout_rate = cond_dropout_rate
+        self.iterations = iterations
 
+        # self.writer = SummaryWriter(logger.get_current() / 'tensorboard')
+        self.step = 0
+        self.resume_step = 0
+        self.global_batch = self.batch_size * dist.get_world_size()
+
+        self.sync_cuda = th.cuda.is_available()
+
+        self._load_and_sync_parameters()
+        self.mp_trainer = MixedPrecisionTrainer(
+            model=self.model,
+            use_fp16=self.use_fp16,
+            fp16_scale_growth=fp16_scale_growth,
+        )
+
+        self.opt = AdamW(
+            self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
+        )
+        if self.resume_step:
+            self._load_optimizer_state()
+            # Model was resumed, either due to a restart or a checkpoint
+            # being specified at the command line.
+            self.ema_params = [
+                self._load_ema_parameters(rate) for rate in self.ema_rate
+            ]
+        else:
+            self.ema_params = [
+                copy.deepcopy(self.mp_trainer.master_params)
+                for _ in range(len(self.ema_rate))
+            ]
+
+        if th.cuda.is_available():
+            self.use_ddp = True
+            self.ddp_model = DDP(
+                self.model,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=True,
+            )
+        else:
+            if dist.get_world_size() > 1:
+                logger.warn(
+                    "Distributed training requires CUDA. "
+                    "Gradients will not be synchronized properly!"
+                )
+            self.use_ddp = False
+            self.ddp_model = self.model
+
+    def forward_backward(self, data_dict, phase: str = "train"):
+        # self.main_data_identifier = "image"
+        batch = data_dict.pop(self.main_data_identifier)
+        model_conditionals = data_dict
+
+        assert phase in ["train", "val"]
+        if phase == "train":
+            self.ddp_model.train()
+            if self.cond_dropout_rate != 0:
+                model_conditionals = self.conditioning_dropout(model_conditionals)
+        else:
+            self.ddp_model.eval()
+        
+        self.mp_trainer.zero_grad()
+        for i in range(0, batch.shape[0], self.microbatch):
+            micro = batch[i: i + self.microbatch].to(dist_util.dev())
+            micro_cond = {
+                k: v[i: i + self.microbatch].to(dist_util.dev())
+                for k, v in model_conditionals.items()
+            }
+            last_batch = (i + self.microbatch) >= batch.shape[0]
+            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+            
+            compute_losses = [functools.partial(
+                self.diffusion.training_losses,
+                self.ddp_model,
+                micro[env],
+                t,
+                model_kwargs=micro_cond
+            ) for env in micro.keys()]
+
+            # TODO:
+            irm_objective = add_dicts([loss() for loss in compute_losses])
+
+            if last_batch or not self.use_ddp:
+                # IRM objective
+                losses = irm_objective
+            else:
+                with self.ddp_model.no_sync():
+                    losses = irm_objective
+
+            if isinstance(self.schedule_sampler, LossAwareSampler):
+                self.schedule_sampler.update_with_local_losses(
+                    t, losses["loss"].detach()
+                )
+
+            loss = (losses["loss"] * weights).mean()
+            log_loss_dict(
+                self.diffusion, t, {phase + '_' + k: v * weights for k, v in losses.items()}
+            )
+            if phase == "train":
+                self.mp_trainer.backward(loss)
+
+def add_dicts(dicts: list):
+    sum_dict = {}
+    for i,dict in enumerate(dicts):
+        if i == 0:
+            for k in dict.keys():
+                sum_dict[k] = dict[k]
+        else:
+            assert(sum_dict.keys() == dict.keys()), "Dictionaries have different keys"
+            for k in dict.keys():
+                sum_dict[k] += dict[k]
+    
+    return sum_dict
 
 def parse_resume_step_from_filename(filename):
     """

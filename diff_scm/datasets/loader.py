@@ -18,6 +18,9 @@ def get_data_loader(dataset, config, split_set, generator = True):
     if dataset == "mnist":
         loader = get_data_loader_mnist(config.data.path, config.sampling.batch_size, 
                                     split_set=split_set, which_label=config.classifier.label)
+    elif dataset == "colored_mnist":
+        loader = get_data_loader_colored_mnist(config.data_path, config.sampling.batch_size,
+                                               split_set=split_set, which_label=config.classifier.label)
     elif dataset == "brats":
         loader = get_data_loader_brats(config.data.path, config.sampling.batch_size, split_set=split_set,
                                             sequence_translation = config.data.sequence_translation)
@@ -40,6 +43,54 @@ def get_data_loader_mnist(path, batch_size, split_set: str = 'train', which_labe
 
     return torch.utils.data.DataLoader(dataset, **default_kwargs)
 
+def get_data_loader_colored_mnist(path, batch_size, split_set: str = 'train', which_label: str = 'class'):
+    assert split_set in ["train", "val", "test"]
+    default_kwargs = {"shuffle": True, "num_workers": 1, "drop_last": True, "batch_size": batch_size}
+    dataset = MNIST_dataset(root_dir=path, train=split_set != "test")
+    
+    def create_environment(images, labels, e):
+        def torch_bernoulli(p, size):
+            return (torch.rand(size) < p).float()
+        def torch_xor(a, b):
+            return (a-b).abs() # Assumes both inputs are either 0 or 1
+        # 2x subsample for computational convenience
+        images = images.reshape((-1, 28, 28))[:, ::2, ::2]
+        # Assign a binary label based on the digit; flip label with probability 0.25
+        labels = (labels < 5).float()
+        labels = torch_xor(labels, torch_bernoulli(0.25, len(labels)))
+        # Assign a color based on the label; flip the color with probability e
+        colors = torch_xor(labels, torch_bernoulli(e, len(labels)))
+        # Apply the color to the image by zeroing out the other color channel
+        images = torch.stack([images, images], dim=1)
+        images[torch.tensor(range(len(images))), (1-colors).long(), :, :] *= 0
+
+        return {
+            'images': (images.float() / 255.).cuda(),
+            'labels': labels[:, None].cuda()
+        }
+    
+    if split_set != "test":
+        val_ratio = 0.1
+        split = torch.utils.data.random_split(dataset,
+                                              [int(len(dataset) * (1 - val_ratio)), int(len(dataset) * val_ratio)],
+                                              generator=torch.Generator().manual_seed(42))
+        dataset = split[0] if split_set == "train" else split[1]
+    
+    if split_set == "train":
+        env1 = create_environment(dataset.images[::2], dataset.labels[::2], 0.2)
+        env2 = create_environment(dataset.images[1::2], dataset.labels[1::2], 0.1)
+        dataset.images = {1: env1['images'], 2: env2['images']}
+        dataset.labels = {1: env1['labels'], 2: env2['labels']}
+    elif split_set == "val":
+        env = create_environment(dataset.images, dataset.labels, 0.9)
+        dataset.images = env['images']
+        dataset.labels = env['labels']
+    else:
+        env = create_environment(dataset.images, dataset.labels, 0.8)
+        dataset.images = env['images']
+        dataset.labels = env['labels']
+    
+    return torch.utils.data.DataLoader(dataset, **default_kwargs)
 
 def get_data_loader_brats(path, batch_size, split_set: str = 'train',
                              sequence_translation : bool = False, 

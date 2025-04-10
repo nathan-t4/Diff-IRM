@@ -9,7 +9,7 @@ from diff_scm.configs import get_config
 from diff_scm.utils import logger, dist_util
 from diff_scm.models.resample import create_named_schedule_sampler
 from diff_scm.utils.script_util import create_gaussian_diffusion, create_score_model
-from diff_scm.training.train_util import TrainLoop
+from diff_scm.training.train_util import IRMTrainLoop
 from diff_scm.datasets import loader
 
 
@@ -34,7 +34,7 @@ def main(args):
     val_loader = loader.get_data_loader(args.dataset, config, split_set='val', generator = True)
 
     logger.log("training...")
-    TrainLoop(
+    IRMTrainLoop(
         model=model,
         diffusion=diffusion,
         data=train_loader ,
@@ -58,9 +58,8 @@ def main(args):
 
 
 if __name__ == "__main__":
-    
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", help="mnist or brats", type=str, default='brats')
+    parser.add_argument("--dataset", help="colored_mnist", type=str,default='colored_mnist')
     args = parser.parse_args()
     print(args.dataset)
     main(args)
