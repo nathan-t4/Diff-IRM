@@ -167,23 +167,30 @@ class TrainLoop:
             self.opt.load_state_dict(state_dict)
 
     def run_loop(self):
+        best_val_loss = 1e5
         while (
                 not self.lr_anneal_steps
                 or self.step + self.resume_step < self.iterations
         ):
+            val_loss = 0.0
             data_dict = next(self.data)
             self.run_step(data_dict)
-            if self.step % self.save_interval == 0:
-                self.save()
+            # if self.step % self.save_interval == 0:
+            #     self.save()
             if self.step % self.log_interval == 0:
                 for val_step in range(self.log_interval):
                     val_data_dict = next(self.data_val)
-                    self.forward_backward(val_data_dict, phase="val")
+                    val_loss += self.forward_backward(val_data_dict, phase="val")
                 logger.dumpkvs()
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self.save()
+                
             self.step += 1
-        # Save the last checkpoint if it wasn't already saved.
-        if (self.step - 1) % self.save_interval != 0:
-            self.save()
+        # # Save the last checkpoint if it wasn't already saved.
+        # if (self.step - 1) % self.save_interval != 0:
+        #     self.save()
 
     def run_step(self, data_dict):
         self.forward_backward(data_dict, phase="train")
@@ -203,8 +210,6 @@ class TrainLoop:
         model_conditionals["y"][th.randint(model_conditionals["y"].shape[0],(idx2drop,))] = self.model.num_classes
         
         return model_conditionals
-        
-
 
     def forward_backward(self, data_dict, phase: str = "train"):
         
@@ -220,6 +225,7 @@ class TrainLoop:
         else:
             self.ddp_model.eval()
         
+        total_loss = 0.0
         self.mp_trainer.zero_grad()
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i: i + self.microbatch].to(dist_util.dev())
@@ -255,6 +261,9 @@ class TrainLoop:
             )
             if phase == "train":
                 self.mp_trainer.backward(loss)
+            
+            total_loss += loss
+        return total_loss.detach()
 
     def _update_ema(self):
         for rate, params in zip(self.ema_rate, self.ema_params):
@@ -409,16 +418,20 @@ class IRMTrainLoop(TrainLoop):
         else:
             self.ddp_model.eval()
         
+        total_loss = 0.0
         self.mp_trainer.zero_grad()
-        for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i: i + self.microbatch].to(dist_util.dev())
+        batch_size = min([batch[k].shape[0] for k in batch.keys()])
+        for i in range(0, batch_size, self.microbatch):
+            micro = {env : batch[env][i: i + self.microbatch].to(dist_util.dev()) for env in batch.keys() }
             micro_cond = {
-                k: v[i: i + self.microbatch].to(dist_util.dev())
+                k : { env : v[env][i: i + self.microbatch].to(dist_util.dev()) for env in batch.keys() }
                 for k, v in model_conditionals.items()
             }
-            last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
-            
+            last_batch = (i + self.microbatch) >= batch_size
+            microbatch_size = min([micro[env].shape[0] for env in micro.keys()])
+            t, weights = self.schedule_sampler.sample(microbatch_size, dist_util.dev())
+
+            # micro[env] has shape is 100 3 28 28
             compute_losses = [functools.partial(
                 self.diffusion.training_losses,
                 self.ddp_model,
@@ -448,8 +461,13 @@ class IRMTrainLoop(TrainLoop):
             )
             if phase == "train":
                 self.mp_trainer.backward(loss)
+            
+            total_loss += loss
+        
+        return total_loss.detach()
 
 def add_dicts(dicts: list):
+    """ returns: sum_dict[key] = sum([d[key] for d in dicts])"""
     sum_dict = {}
     for i,dict in enumerate(dicts):
         if i == 0:

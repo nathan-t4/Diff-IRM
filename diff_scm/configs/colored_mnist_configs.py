@@ -9,16 +9,16 @@ import os
 def get_default_configs():
     config = ml_collections.ConfigDict()
 
-    config.dataset_name = "MNIST"
+    config.dataset_name = "ColoredMNIST"
     config.experiment_name = "exp_02_" + config.dataset_name
     
-    use_gpus = "0"  # e.g. "0,1,2"
+    use_gpus = "0,1,2,3,4,5"  # e.g. "0,1,2"
     os.environ["CUDA_VISIBLE_DEVICES"] = use_gpus
     # data
     config.data = data = ml_collections.ConfigDict()
     data.path = Path("/store/nt9637/Diff-IRM") / config.dataset_name
     # experiment_path = r"../runs/"
-    experiment_path = Path("/store/nt9637/Diff-IRM/runs/")
+    config.experiment_path = "/store/nt9637/Diff-IRM/runs/"
     ## Diffusion parameters
     config.diffusion = diffusion = ml_collections.ConfigDict()
     diffusion.steps = 1000
@@ -37,7 +37,7 @@ def get_default_configs():
     config.score_model = score_model = ml_collections.ConfigDict()
     score_model.image_size = 28
     score_model.classifier_free_cond = False
-    score_model.num_input_channels = 1
+    score_model.num_input_channels = 3 # TODO: changed from 1 to 3.
     score_model.num_channels = 32
     score_model.num_res_blocks = 1
     score_model.num_heads = 1
@@ -131,8 +131,8 @@ def get_default_configs():
     sampling.eta = 0.0
     sampling.image_conditional = False
     sampling.label_of_intervention = "y" 
-    sampling.model_path = os.path.join(experiment_path, config.experiment_name, "/score_train/model003000.pt")
-    sampling.classifier_path = os.path.join(experiment_path, config.experiment_name,"/classifier_train_" + "_".join(config.classifier.label) + "/model001000.pt")
+    sampling.model_path = os.path.join(config.experiment_path, config.experiment_name, "/score_train/model003000.pt")
+    sampling.classifier_path = os.path.join(config.experiment_path, config.experiment_name,"/classifier_train_" + "_".join(config.classifier.label) + "/model001000.pt")
     sampling.classifier_scale = 1.0
     sampling.target_class = 5    
     sampling.sampling_progression_ratio = 0.75

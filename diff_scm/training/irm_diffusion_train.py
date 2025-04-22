@@ -1,6 +1,7 @@
 """
 Train a diffusion model on images.
 """
+import os
 from pathlib import Path
 import sys
 sys.path.append(str(Path.cwd()))
@@ -17,7 +18,7 @@ def main(args):
     config = get_config.file_from_dataset(args.dataset)
 
     dist_util.setup_dist()
-    logger.configure(Path(config.experiment_name)/"score_train",
+    logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, "score_train")),
                      format_strs=["log", "stdout", "csv", "tensorboard"])
 
     logger.log("creating model and diffusion...")
@@ -30,8 +31,8 @@ def main(args):
 
 
     logger.log("creating data loader...")
-    train_loader = loader.get_data_loader(args.dataset, config, split_set='train', generator = True) 
-    val_loader = loader.get_data_loader(args.dataset, config, split_set='val', generator = True)
+    train_loader = loader.get_data_loader(args.dataset, config, split_set='train', generator = True, irm=True) 
+    val_loader = loader.get_data_loader(args.dataset, config, split_set='val', generator = True, irm=True)
 
     logger.log("training...")
     IRMTrainLoop(
@@ -59,7 +60,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", help="colored_mnist", type=str,default='colored_mnist')
+    parser.add_argument("--dataset", help="training dataset", type=str, default='colored_mnist')
     args = parser.parse_args()
     print(args.dataset)
     main(args)

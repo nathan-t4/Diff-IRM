@@ -21,7 +21,7 @@ from diff_scm.utils import logger, dist_util
 from diff_scm.utils.script_util import create_anti_causal_predictor, create_gaussian_diffusion
 from diff_scm.utils.fp16_util import MixedPrecisionTrainer
 from diff_scm.models.resample import create_named_schedule_sampler
-from diff_scm.training.train_util import parse_resume_step_from_filename, log_loss_dict
+from diff_scm.training.train_util import parse_resume_step_from_filename, log_loss_dict, add_dicts
 from diff_scm.datasets import loader
 
 
@@ -29,7 +29,7 @@ def main(args):
     config = get_config.file_from_dataset(args.dataset)
 
     dist_util.setup_dist()
-    logger.configure(Path(config.experiment_name) / ("classifier_train_" + "_".join(config.classifier.label)),
+    logger.configure(Path(os.path.join(config.experiment_path, "classifier_train_" + "_".join(config.classifier.label))),
                      format_strs=["log", "stdout", "csv", "tensorboard"])
 
     logger.log("creating model and diffusion...")
@@ -45,8 +45,8 @@ def main(args):
 
     logger.log("creating data loader...")
 
-    data = loader.get_data_loader(args.dataset, config, split_set='train', generator = True) 
-    val_data = loader.get_data_loader(args.dataset, config, split_set='val', generator = True)
+    data = loader.get_data_loader(args.dataset, config, split_set='train', generator=True, irm=args.irm) 
+    val_data = loader.get_data_loader(args.dataset, config, split_set='val', generator=True, irm=args.irm)
 
     logger.log("training...")
 
@@ -93,20 +93,37 @@ def main(args):
 
     logger.log("training classifier model...")
 
-    def forward_backward_log(data_loader, prefix="train"):
+    def forward_backward_log(data_loader, prefix="train", irm: bool = False):
         data_dict = next(data_loader)
-        batch = data_dict["image"].to(dist_util.dev())
+        batch = data_dict["image"]
         if args.dataset == "brats":
             batch = torchvision.transforms.Resize(size=256)(batch)
-        labels = data_dict["y"].to(dist_util.dev())
+        labels = data_dict["y"]
+        batch_size = batch[next(iter(batch))].shape[0] if irm else batch.shape[0]
+
+        if irm:
+            for e in batch.keys():
+                batch[e] = batch[e].to(dist_util.dev())
+                labels[e] = labels[e].to(dist_util.dev())
+        else:
+            batch = batch.to(dist_util.dev())
+            labels = labels.to(dist_util.dev())
 
         # Noisy images
         if config.classifier.training.noised:
-            t, _ = schedule_sampler.sample(batch.shape[0], dist_util.dev())
-            batch = diffusion.q_sample(batch, t)
+            t, _ = schedule_sampler.sample(batch_size, dist_util.dev())
+            if irm:
+                batch = {e : diffusion.q_sample(batch[e], t) for e in batch.keys()}
+            else:
+                batch = diffusion.q_sample(batch, t)
         else:
-            t = th.zeros(batch.shape[0], dtype=th.long, device=dist_util.dev())
-        loss_dict = get_predictor_loss(model, labels, batch, t)
+            t = th.zeros(batch_size, dtype=th.long, device=dist_util.dev())
+        
+        if irm:
+            loss_dict = add_dicts([get_predictor_loss(model, labels[e], batch[e], t) for e in batch.keys()])
+        else:
+            loss_dict = get_predictor_loss(model, labels, batch, t)
+        
         loss = torch.stack(list(loss_dict.values())).sum()
         losses = {f"{prefix}_{loss_name}": loss_value.detach() for loss_name, loss_value in loss_dict.items()}
         # losses[f"{prefix}_acc@1"] = compute_top_k(logits, labels, k=1, reduction="none")
@@ -127,13 +144,13 @@ def main(args):
         if config.classifier.training.anneal_lr:
             set_annealed_lr(opt, config.classifier.training.lr,
                             (step + resume_step) / config.classifier.training.iterations)
-        forward_backward_log(data)
+        forward_backward_log(data, irm=args.irm)
         mp_trainer.optimize(opt)
         if val_data is not None and not step % config.classifier.training.eval_interval:
             with th.no_grad():
                 with model.no_sync():
                     model.eval()
-                    forward_backward_log(val_data, prefix="val")
+                    forward_backward_log(val_data, prefix="val", irm=args.irm)
                     model.train()
         if not step % config.classifier.training.log_interval:
             logger.dumpkvs()
@@ -199,9 +216,9 @@ def split_microbatches(microbatch, *args):
             yield tuple(x[i: i + microbatch] if x is not None else None for x in args)
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", help="mnist or brats", type=str)
+    parser.add_argument("--irm", action='store_true')
     args = parser.parse_args()
     print(args.dataset)
     main(args)

@@ -30,8 +30,8 @@ def main(args):
 
 
     logger.log("creating data loader...")
-    train_loader = loader.get_data_loader(args.dataset, config, split_set='train', generator = True) 
-    val_loader = loader.get_data_loader(args.dataset, config, split_set='val', generator = True)
+    train_loader = loader.get_data_loader(args.dataset, config, split_set='train', generator = True, irm=False) 
+    val_loader = loader.get_data_loader(args.dataset, config, split_set='val', generator = True, irm=False)
 
     logger.log("training...")
     TrainLoop(
@@ -60,7 +60,7 @@ def main(args):
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", help="mnist or brats", type=str, default='brats')
+    parser.add_argument("--dataset", help="mnist or brats", type=str, default='mnist')
     args = parser.parse_args()
     print(args.dataset)
     main(args)

@@ -1,8 +1,10 @@
-from diff_scm.configs import mnist_configs, brats_configs
+from diff_scm.configs import mnist_configs, colored_mnist_configs, brats_configs
 
 def file_from_dataset(dataset_name):
     if dataset_name == "mnist":
         return mnist_configs.get_default_configs()
+    elif dataset_name == "colored_mnist":
+        return colored_mnist_configs.get_default_configs()
     elif dataset_name == "brats":
         return brats_configs.get_default_configs()
     else:
