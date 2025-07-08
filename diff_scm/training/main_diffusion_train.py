@@ -1,6 +1,7 @@
 """
 Train a diffusion model on images.
 """
+import os
 from pathlib import Path
 import sys
 sys.path.append(str(Path.cwd()))
@@ -8,8 +9,8 @@ import argparse
 from diff_scm.configs import get_config
 from diff_scm.utils import logger, dist_util
 from diff_scm.models.resample import create_named_schedule_sampler
-from diff_scm.utils.script_util import create_gaussian_diffusion, create_score_model
-from diff_scm.training.train_util import TrainLoop
+from diff_scm.utils.script_util import create_gaussian_diffusion, create_score_model, create_noise_encoder
+from diff_scm.training.train_util import TrainLoop, MultiTrainLoop
 from diff_scm.datasets import loader
 
 
@@ -17,12 +18,13 @@ def main(args):
     config = get_config.file_from_dataset(args.dataset)
 
     dist_util.setup_dist()
-    logger.configure(Path(config.experiment_name)/"score_train",
+    logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, "score_train", "test_2")),
                      format_strs=["log", "stdout", "csv", "tensorboard"])
 
     logger.log("creating model and diffusion...")
     diffusion = create_gaussian_diffusion(config)
     model = create_score_model(config)
+    noise_encoder = create_noise_encoder(config)
     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model.to(dist_util.dev())
     logger.log(f"Model number of parameters {pytorch_total_params}")
@@ -34,8 +36,9 @@ def main(args):
     val_loader = loader.get_data_loader(args.dataset, config, split_set='val', generator = True, irm=False)
 
     logger.log("training...")
-    TrainLoop(
+    MultiTrainLoop( # Testing
         model=model,
+        noise_encoder=noise_encoder,
         diffusion=diffusion,
         data=train_loader ,
         data_val=val_loader,
@@ -53,6 +56,8 @@ def main(args):
         lr_anneal_steps=config.score_model.training.lr_anneal_steps,
         cond_dropout_rate = config.score_model.training.cond_dropout_rate if config.score_model.class_cond else 0,
         conditioning_variable = config.score_model.training.conditioning_variable,
+        unconditional_default=config.score_model.training.unconditional_default,
+        parents=config.data.parents,
         iterations = config.score_model.training.iterations
     ).run_loop()
 

@@ -5,6 +5,15 @@ import torch
 from diff_scm.datasets.load_brats import BrainDataset
 from diff_scm.datasets.load_mnist import MNIST_dataset
 from diff_scm.datasets.load_colored_mnist import colored_MNIST_dataset
+from diff_scm.datasets.load_morpho_mnist import Morpho_MNIST_Dataset
+from diff_scm.datasets.load_celeba import Celeba
+
+datasets = {
+    'mnist': MNIST_dataset,
+    'colored_mnist': colored_MNIST_dataset,
+    'morpho_mnist': Morpho_MNIST_Dataset,
+    'celeba': Celeba,
+}
 
 
 def seed_worker(worker_id):
@@ -14,7 +23,7 @@ def seed_worker(worker_id):
 g = torch.Generator()
 g.manual_seed(0)
 
-def _plot(dataset):
+def _plot(dataset, colored=False):
     import matplotlib.pyplot as plt
     fig = plt.figure(figsize=(13, 8))
     columns = 6
@@ -22,17 +31,34 @@ def _plot(dataset):
     # ax enables access to manipulate each of subplots
     ax = []
 
+    irm = isinstance(dataset[0]["image"], dict)
+
     for i in range(columns * rows):
-        if type(dataset.images) == dict:
-            img, label = dataset.images[1][i], dataset.labels[1][i]
-        else:
-            img, label = dataset.images[i], dataset.labels[i]
+        img = dataset[i]["image"][1] if irm else dataset[i]["image"]
+        img = np.einsum("cwh->whc", img)
+        
+        attributes = {att : dataset.metrics[att][i] for att in dataset.attributes}
+        attributes = [dataset.unnormalize_fn(v, n) for n, v in attributes.items()] if dataset.normalize else [v for n,v in attributes.items()]
+        if i == 0:
+            print(attributes)
+        labels = []
+        for att in attributes:
+            if att.shape == ():
+                labels.append(f"{att:.2}" if (att.dtype == torch.float32) else f"{att}")
+            else:
+                raise NotImplementedError()
+        label = ", ".join(labels)
+
+
         # create subplot and append to ax
         ax.append(fig.add_subplot(rows, columns, i + 1))
-        ax[-1].set_title("Label: " + str(label))  # set title
-        plt.imshow(img)
+        ax[-1].set_title(str(label))  # set title
+        if img.shape[2] == 3: # rgb
+            plt.imshow(img)
+        else:
+            plt.imshow(img, 'grey')
 
-    plt.savefig("test.png")  # finally, render the plot
+    plt.savefig(f"test.png")  # finally, render the plot
 
 
 def get_data_loader(dataset, config, split_set, generator = True, irm = False):
@@ -45,10 +71,34 @@ def get_data_loader(dataset, config, split_set, generator = True, irm = False):
     elif dataset == "brats":
         loader = get_data_loader_brats(config.data.path, config.sampling.batch_size, split_set=split_set,
                                             sequence_translation = config.data.sequence_translation)
+    elif dataset in datasets:
+        loader = get_data_loader_default(datasets[dataset], config.data.attribute_size, config.data.path, config.sampling.batch_size, config.data.normalize,
+                                         split_set=split_set, which_label=config.classifier.label)
     else:
         raise Exception("Dataset does exit")
     
     return get_generator_from_loader(loader) if generator else loader
+
+def get_data_loader_default(torch_dataset, attribute_size, path, batch_size, normalize: bool, split_set: str = 'train', which_label: str = 'class'):
+    assert split_set in ["train", "val", "test"]
+    default_kwargs = {"shuffle": True, "num_workers": 1, "drop_last": True, "batch_size": batch_size}
+    
+    # Make test set deterministic
+    if split_set == "test":
+        default_kwargs["shuffle"] = False
+
+    dataset = torch_dataset(attribute_size=attribute_size, root_dir=path, train=split_set != "test", normalize_=normalize)
+    
+    # _plot(dataset)
+
+    if split_set != "test":
+        val_ratio = 0.1
+        split = torch.utils.data.random_split(dataset,
+                                              [int(len(dataset) * (1 - val_ratio)), int(len(dataset) * val_ratio)],
+                                              generator=torch.Generator().manual_seed(42))
+        dataset = split[0] if split_set == "train" else split[1]
+        
+    return torch.utils.data.DataLoader(dataset, **default_kwargs)
 
 def get_data_loader_mnist(path, batch_size, split_set: str = 'train', which_label: str = "class"):
     assert split_set in ["train", "val", "test"]
@@ -70,8 +120,33 @@ def get_data_loader_mnist(path, batch_size, split_set: str = 'train', which_labe
 def get_data_loader_colored_mnist(path, batch_size, split_set: str = 'train', which_label: str = 'class', irm: bool = False):
     assert split_set in ["train", "val", "test"]
     default_kwargs = {"shuffle": True, "num_workers": 1, "drop_last": True, "batch_size": batch_size}
+    # Make test set deterministic
+    if split_set == "test":
+        default_kwargs["shuffle"] = False
+
     dataset = colored_MNIST_dataset(root_dir=path, train=split_set != "test", irm=irm) # create colored mnist
 
+    _plot(dataset)
+
+    if split_set != "test":
+        val_ratio = 0.1
+        split = torch.utils.data.random_split(dataset,
+                                              [int(len(dataset) * (1 - val_ratio)), int(len(dataset) * val_ratio)],
+                                              generator=torch.Generator().manual_seed(42))
+        dataset = split[0] if split_set == "train" else split[1]
+        
+    return torch.utils.data.DataLoader(dataset, **default_kwargs)
+
+def get_data_loader_morpho_mnist(attribute_size, path, batch_size, split_set: str = 'train', which_label: str = 'class'):
+    assert split_set in ["train", "val", "test"]
+    default_kwargs = {"shuffle": True, "num_workers": 1, "drop_last": True, "batch_size": batch_size}
+    
+    # Make test set deterministic
+    if split_set == "test":
+        default_kwargs["shuffle"] = False
+
+    dataset = Morpho_MNIST_Dataset(attribute_size=attribute_size, root_dir=path, train=split_set != "test")
+    
     _plot(dataset)
 
     if split_set != "test":

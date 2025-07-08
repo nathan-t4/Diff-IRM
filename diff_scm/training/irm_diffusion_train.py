@@ -15,10 +15,11 @@ from diff_scm.datasets import loader
 
 
 def main(args):
+    """ TODO: change IRM objective... """
     config = get_config.file_from_dataset(args.dataset)
 
     dist_util.setup_dist()
-    logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, "score_train")),
+    logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, "score_train", "irm3")),
                      format_strs=["log", "stdout", "csv", "tensorboard"])
 
     logger.log("creating model and diffusion...")

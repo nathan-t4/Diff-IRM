@@ -12,11 +12,11 @@ def get_default_configs():
     config.dataset_name = "ColoredMNIST"
     config.experiment_name = "exp_02_" + config.dataset_name
     
-    use_gpus = "0,1,2,3,4,5"  # e.g. "0,1,2"
+    use_gpus = "1"  # e.g. "0,1,2"
     os.environ["CUDA_VISIBLE_DEVICES"] = use_gpus
     # data
     config.data = data = ml_collections.ConfigDict()
-    data.path = Path("/store/nt9637/Diff-IRM") / config.dataset_name
+    data.path = Path("/store/nt9637/Diff-IRM/datasets") / config.dataset_name
     # experiment_path = r"../runs/"
     config.experiment_path = "/store/nt9637/Diff-IRM/runs/"
     ## Diffusion parameters
@@ -36,8 +36,8 @@ def get_default_configs():
     ## score model config
     config.score_model = score_model = ml_collections.ConfigDict()
     score_model.image_size = 28
-    score_model.classifier_free_cond = False
-    score_model.num_input_channels = 3 # TODO: changed from 1 to 3.
+    score_model.classifier_free_cond = True # TODO: try True
+    score_model.num_input_channels = 3
     score_model.num_channels = 32
     score_model.num_res_blocks = 1
     score_model.num_heads = 1
@@ -54,14 +54,14 @@ def get_default_configs():
 
     score_model.channel_mult = (1, 2, 2)
     score_model.dropout = 0.1
-    score_model.class_cond = False
+    score_model.class_cond = True # TODO: for unconditional training
     score_model.use_checkpoint = False
     score_model.use_scale_shift_norm = True
     score_model.resblock_updown = False
     score_model.use_fp16 = False
     score_model.use_new_attention_order = False
     score_model.num_classes = 10
-    score_model.image_level_cond = False
+    score_model.image_level_cond = False # adds image as conditional
 
     # score model training
     config.score_model.training = training_score = ml_collections.ConfigDict()
@@ -79,7 +79,7 @@ def get_default_configs():
     training_score.use_fp16 = score_model.use_fp16
     training_score.fp16_scale_growth = 1e-3
     training_score.conditioning_variable = "y"
-    training_score.cond_dropout_rate = 0.0
+    training_score.cond_dropout_rate = 0.1 # TODO: for unconditional training, try 0.1 (from Classifier-Free Diffusion Guidance paper)
 
     ## classifier config
 
@@ -129,13 +129,14 @@ def get_default_configs():
     sampling.use_ddim = True
     sampling.reconstruction = True
     sampling.eta = 0.0
-    sampling.image_conditional = False
+    sampling.image_conditional = False # TODO not included anywhere
     sampling.label_of_intervention = "y" 
-    sampling.model_path = os.path.join(config.experiment_path, config.experiment_name, "/score_train/model003000.pt")
-    sampling.classifier_path = os.path.join(config.experiment_path, config.experiment_name,"/classifier_train_" + "_".join(config.classifier.label) + "/model001000.pt")
+    sampling.model_path_fn = lambda exp : os.path.join(config.experiment_path, config.experiment_name, "score_train", exp, "best_model.pt")
+    sampling.classifier_path_fn = lambda exp : os.path.join(config.experiment_path, config.experiment_name, "classifier_train_" + "_".join(config.classifier.label), exp, "best_model.pt")
     sampling.classifier_scale = 1.0
     sampling.target_class = 5    
     sampling.sampling_progression_ratio = 0.75
+    sampling.norm_cond_scale = 1.0
     config.seed = 42
     config.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 

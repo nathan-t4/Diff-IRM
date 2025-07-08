@@ -4,12 +4,14 @@ import ml_collections
 from diff_scm.utils import dist_util
 from diff_scm.models import gaussian_diffusion as gd
 from diff_scm.models import unet
+from diff_scm.models import encoder
 from diff_scm.models.respace import SpacedDiffusion, space_timesteps
 
 
 def get_models_from_config(config):
     diffusion = create_gaussian_diffusion(config)
     model = create_score_model(config)
+    print("Model Path", config.sampling.model_path)
     model.load_state_dict(
         dist_util.load_state_dict(config.sampling.model_path, map_location=dist_util.dev())
     )
@@ -17,7 +19,7 @@ def get_models_from_config(config):
     if config.score_model.use_fp16:
         model.convert_to_fp16()
     model.eval()
-    
+    print("Classifier Path", config.sampling.classifier_path)
     if config.sampling.classifier_scale != 0:
         classifier = create_anti_causal_predictor(config)
         classifier.load_state_dict(
@@ -31,6 +33,12 @@ def get_models_from_config(config):
         classifier = None
     return classifier, diffusion, model
 
+def create_noise_encoder(config: ml_collections.ConfigDict):
+    return encoder.MLP(
+        in_dim=config.encoder.num_input_channels,
+        out_dim=config.encoder.num_output_channels,
+        hidden_dim=config.encoder.num_hidden_channels,
+    )
 
 def create_score_model(config: ml_collections.ConfigDict):
     return unet.UNetModel(
@@ -52,6 +60,7 @@ def create_score_model(config: ml_collections.ConfigDict):
         use_scale_shift_norm=config.score_model.use_scale_shift_norm,
         resblock_updown=config.score_model.resblock_updown,
         image_level_cond=config.score_model.image_level_cond,
+        discrete_labels=config.score_model.discrete_labels,
     )
 
 def create_anti_causal_predictor(config):
@@ -77,9 +86,59 @@ def create_anti_causal_predictor(config):
     else:
         model = unet.AntiCausalMechanism(encoders=enc, out_labels=config.classifier.label,
                                     out_channels=config.classifier.out_channels)
-    print(model)
+    # print(model)
     return model
 
+def get_multi_models_from_config(config):
+    diffusion = create_gaussian_diffusion(config)
+    model = create_score_model(config)
+    print("Model Path", config.sampling.model_path)
+    model.load_state_dict(
+        dist_util.load_state_dict(config.sampling.model_path, map_location=dist_util.dev())
+    )
+    model.to(dist_util.dev())
+    if config.score_model.use_fp16:
+        model.convert_to_fp16()
+    model.eval()
+    try:
+        print("Classifier Path", config.sampling.classifier_path)
+        classifier = create_anti_parent_predictor(config)
+        classifier.load_state_dict(
+            dist_util.load_state_dict(config.sampling.classifier_path, map_location=dist_util.dev())
+        )
+        classifier.to(dist_util.dev())
+        if config.classifier.classifier_use_fp16:
+            classifier.convert_to_fp16()
+        classifier.eval()
+    except:
+        FileNotFoundError("No classifier used")
+    
+    return classifier, diffusion, model
+
+def create_anti_parent_predictor(config):
+    enc = []
+    nb_variables = len(config.classifier.label)
+    for i in range(nb_variables):
+        enc.append(unet.EncoderUNetModel(
+            image_size=config.classifier.image_size,
+            in_channels=config.classifier.in_channels,
+            model_channels=config.classifier.classifier_width,
+            out_channels=config.classifier.out_channels[i],
+            num_res_blocks=config.classifier.classifier_depth,
+            attention_resolutions=config.classifier.attention_ds,
+            channel_mult=config.classifier.channel_mult,
+            use_fp16=config.classifier.classifier_use_fp16,
+            num_head_channels=64,
+            use_scale_shift_norm=config.classifier.classifier_use_scale_shift_norm,
+            resblock_updown=config.classifier.classifier_resblock_updown,
+            pool=config.classifier.classifier_pool,
+        ))
+        
+    out_labels = ["attrs"]
+    model = unet.ConditionalAntiParentMechanism(encoders=enc, out_labels=out_labels,
+                                out_channels=config.classifier.out_channels)
+    print(model)
+    return model
 
 
 def create_gaussian_diffusion(config):

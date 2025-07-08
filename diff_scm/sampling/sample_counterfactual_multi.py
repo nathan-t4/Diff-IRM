@@ -17,26 +17,23 @@ import matplotlib.pyplot as plt
 from diff_scm.datasets import loader
 from diff_scm.configs import get_config
 from diff_scm.utils import logger, dist_util, script_util
-from diff_scm.sampling.sampling_utils import get_models_functions, estimate_counterfactual
+from diff_scm.sampling.sampling_multi_utils import get_models_functions, estimate_counterfactual # TODO
+
+from diff_scm.datasets.load_morpho_mnist import unnormalize
 
 def main(args):
     config = get_config.file_from_dataset(args.dataset)
 
     dist_util.setup_dist()
-    if args.irm:
-        logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, ("counterfactual_sampling_" + "_".join(config.classifier.label)), "irm")))
-        config.sampling.model_path = config.sampling.model_path_fn("irm")
-        config.sampling.classifier_path = config.sampling.classifier_path_fn("irm")
-    else:
-        logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, ("counterfactual_sampling_" + "_".join(config.classifier.label)), "erm")))
-        config.sampling.model_path = config.sampling.model_path_fn("erm")
-        config.sampling.classifier_path = config.sampling.classifier_path_fn("erm")
+    logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, ("counterfactual_sampling_" + "_".join(config.classifier.label)))))
+    config.sampling.model_path = config.sampling.model_path_fn("test_1")
+    config.sampling.classifier_path = config.sampling.classifier_path_fn("")
 
     logger.log("creating loader...")
-    test_loader = loader.get_data_loader(args.dataset, config, split_set='test', generator = False, irm = args.irm)
+    test_loader = loader.get_data_loader(args.dataset, config, split_set='test', generator = False, irm = False)
     logger.log("creating model and diffusion...")
 
-    classifier, diffusion, model = script_util.get_models_from_config(config)
+    classifier, diffusion, model = script_util.get_multi_models_from_config(config)
     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     logger.log(f"Number of parameteres: {pytorch_total_params}")
@@ -52,9 +49,11 @@ def main(args):
                                                 diffusion, cond_fn, model_fn, 
                                                 model_classifier_free_fn, denoised_fn, 
                                                 data_dict)
+        
+        counterfactual_image = np.einsum("bcwh -> bwhc", counterfactual_image.cpu().numpy().clip(0,1))
             
         results_per_sample = {"original": data_dict,
-                              "counterfactual_sample" : counterfactual_image.cpu().numpy().clip(0,1),
+                              "counterfactual_sample" : counterfactual_image,
                                                                 }
 
         if config.sampling.progress:
@@ -78,22 +77,35 @@ def main(args):
         columns = 6
         rows = 3
         fig = plt.figure(figsize=(13, 8))
+        title = [f"{att}: {intervention}" for att, intervention in config.sampling.target_class.items()]
+        fig.suptitle(" ".join(title))
         ax = []
 
         for i in range(columns * rows):
             img = sample_list["counterfactual_sample"][0][i]
-            img = np.einsum("cwh -> hwc", img)
-            label = sample_list["original"][0]["y"][i]
+            # Plot original attributes as subplot title
+            attributes = {att : sample_list["original"][0][att][i] for att in config.data.parents}
+            attributes = [unnormalize(attributes[att], att) for att in config.data.parents] if config.data.normalize else [attributes[att] for att in config.data.parents]
+
+            labels = []
+            for att in attributes:
+                if att.shape == ():
+                    labels.append(f"{att:.2}" if (att.dtype == th.float32) else f"{att}")
+                else:
+                    raise NotImplementedError()
+            label = ", ".join(labels)
             # create subplot and append to ax
             ax.append(fig.add_subplot(rows, columns, i + 1))
-            ax[-1].set_title("Label: " + str(label))  # set title
-            plt.imshow(img)
+            ax[-1].set_title(str(label))  # set title
+            plt.imshow(img, cmap='grey')
         
         plt.axis("off")
-        plt.savefig("test_counterfactuals_irm.png" if args.irm else "test_counterfactuals_erm.png")
+        plt.savefig(f"{config.dataset_name}_counterfactual_{config.sampling.norm_cond_scale}_{config.sampling.beta}_{config.sampling.expected_value_samples}.png")
 
     dist.barrier()
-    logger.log("sampling complete")
+    logger.log(f"sampling complete")
+
+    # TODO: add counterfactual metrics
 
 
 def reseed_random(seed):
@@ -108,7 +120,6 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", help="mnist or brats", type=str)
-    parser.add_argument("--irm", action="store_true")
     args = parser.parse_args()
     print(args.dataset)
     main(args)

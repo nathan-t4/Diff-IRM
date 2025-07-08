@@ -1,4 +1,11 @@
+
 """
+Done:
+- f takes in x_T and w
+
+TODO:
+- dropout w during training
+
 Train a noised image classifier on ImageNet.
 """
 
@@ -15,10 +22,11 @@ import argparse
 from pathlib import Path
 import sys
 sys.path.append(str(Path.cwd()))
+from copy import deepcopy
 
 from diff_scm.configs import get_config
 from diff_scm.utils import logger, dist_util
-from diff_scm.utils.script_util import create_anti_causal_predictor, create_gaussian_diffusion
+from diff_scm.utils.script_util import create_anti_parent_predictor, create_gaussian_diffusion
 from diff_scm.utils.fp16_util import MixedPrecisionTrainer
 from diff_scm.models.resample import create_named_schedule_sampler
 from diff_scm.training.train_util import parse_resume_step_from_filename, log_loss_dict, add_dicts
@@ -28,17 +36,12 @@ def main(args):
     config = get_config.file_from_dataset(args.dataset)
 
     dist_util.setup_dist()
-    if args.irm:
-        logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, "classifier_train_" + "_".join(config.classifier.label)), "Test"),
-                        format_strs=["log", "stdout", "csv", "tensorboard"])
-    else:
-        logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, "classifier_train_" + "_".join(config.classifier.label)), "Test"),
-                         format_strs=["log", "stdout", "csv", "tensorboard"])
-
+    logger.configure(Path(os.path.join(config.experiment_path, config.experiment_name, "antiparent_classifier_train_" + "_".join(config.classifier.label), "test")),
+                    format_strs=["log", "stdout", "csv", "tensorboard"])
     logger.log("creating model and diffusion...")
     diffusion = create_gaussian_diffusion(config)
 
-    model = create_anti_causal_predictor(config)
+    model = create_anti_parent_predictor(config) # Takes x_T, \tilde{w} and returns w
     model.to(dist_util.dev())
 
     if config.classifier.training.noised:
@@ -48,8 +51,8 @@ def main(args):
 
     logger.log("creating data loader...")
 
-    data = loader.get_data_loader(args.dataset, config, split_set='train', generator=True, irm=args.irm) 
-    val_data = loader.get_data_loader(args.dataset, config, split_set='val', generator=True, irm=args.irm)
+    data = loader.get_data_loader(args.dataset, config, split_set='train', generator=True, irm=False) 
+    val_data = loader.get_data_loader(args.dataset, config, split_set='val', generator=True, irm=False)
 
     logger.log("training...")
 
@@ -96,44 +99,47 @@ def main(args):
 
     logger.log("training classifier model...")
 
-    def forward_backward_log(data_loader, prefix="train", irm: bool = False):
+    def conditioning_dropout(model_conditionals: dict, phase="train"):
+        '''         
+        By setting the self.conditioning_variable to self.num_classes,
+            we are telling the Embedding layer in the model to use non-class informative embedding (padding idx default to 0).
+        '''
+        defaults = config.classifier.unconditional_default # {att : config.classifier.unconditional_default for att in model_conditionals.keys()}
+        parent_keys = list(model_conditionals.keys())
+        parent_keys.remove("attrs")
+        parent_keys.remove("image")
+        parents = {}        
+
+        for att in parent_keys:
+            idx2drop = int(model_conditionals[att].shape[0]*config.classifier.cond_dropout_rate)
+            if phase == "train": 
+                model_conditionals[att][th.randint(model_conditionals[att].shape[0],(idx2drop,))] = defaults[att]
+            
+            parents[att] = model_conditionals[att] if len(model_conditionals[att].shape) == 2 else model_conditionals[att].unsqueeze(1)
+        
+        return parents
+
+    def forward_backward_log(data_loader, prefix="train"):
         data_dict = next(data_loader)
         batch = data_dict["image"]
         if args.dataset == "brats":
             batch = torchvision.transforms.Resize(size=256)(batch)
-        labels = data_dict["y"]
-        batch_size = batch[next(iter(batch))].shape[0] if irm else batch.shape[0]
-
-        if irm:
-            for e in batch.keys():
-                batch[e] = batch[e].to(dist_util.dev())
-                labels[e] = labels[e].to(dist_util.dev())
-        else:
-            batch = batch.to(dist_util.dev())
-            labels = labels.to(dist_util.dev())
+        parents = data_dict
+        parents = {att : parents[att].to(dist_util.dev()) for att in parents.keys()}
+        batch_size = batch.shape[0]
+        batch = batch.to(dist_util.dev())
+        cond_parents = conditioning_dropout(deepcopy(parents), phase=prefix) # TODO
 
         # Noisy images
         if config.classifier.training.noised:
             t, _ = schedule_sampler.sample(batch_size, dist_util.dev())
-            if irm:
-                batch = {e : diffusion.q_sample(batch[e], t) for e in batch.keys()}
-            else:
-                batch = diffusion.q_sample(batch, t)
+            batch = diffusion.q_sample(batch, t)
         else:
             t = th.zeros(batch_size, dtype=th.long, device=dist_util.dev())
         
-        loss_dict = add_dicts([get_predictor_loss(model, labels[e], batch[e], t) for e in batch.keys()]) if irm else get_predictor_loss(model, labels, batch, t)
+        loss_dict = get_predictor_loss(model, cond_parents, batch, t, parents)
         
         loss = torch.stack(list(loss_dict.values())).sum()
-
-        # Add IRM loss
-        if irm and prefix == "train":
-            keys = list(batch.keys())
-            scale = th.ones(batch[keys[0]].shape, requires_grad=True).to(dist_util.dev())
-            irm_loss = [F.cross_entropy(model(batch[e] * scale, timesteps=t), labels[e]) for e in keys ]
-            grad = th.autograd.grad(irm_loss, [scale], create_graph=True)[0]
-            loss_dict["irm"] = th.sum(grad ** 2)
-            loss = loss + 1e5 * loss_dict["irm"]
         losses = {f"{prefix}_{loss_name}": loss_value.detach() for loss_name, loss_value in loss_dict.items()}
         # losses[f"{prefix}_acc@1"] = compute_top_k(logits, labels, k=1, reduction="none")
         log_loss_dict(diffusion, t, losses)
@@ -153,13 +159,13 @@ def main(args):
         if config.classifier.training.anneal_lr:
             set_annealed_lr(opt, config.classifier.training.lr,
                             (step + resume_step) / config.classifier.training.iterations)
-        forward_backward_log(data, irm=args.irm)
+        forward_backward_log(data)
         mp_trainer.optimize(opt)
         if val_data is not None and not step % config.classifier.training.eval_interval:
             with th.no_grad():
                 with model.no_sync():
                     model.eval()
-                    forward_backward_log(val_data, prefix="val", irm=args.irm)
+                    forward_backward_log(val_data, prefix="val")
                     model.train()
         if not step % config.classifier.training.log_interval:
             logger.dumpkvs()
@@ -177,8 +183,8 @@ def main(args):
     dist.barrier()
 
 
-def get_predictor_loss(model, labels, batch, t):
-    output = model(batch, timesteps=t)
+def get_predictor_loss(model, y, batch, t, labels):
+    output = model(batch, y=y, timesteps=t)
     loss_dict = {}
     '''if isinstance(output, Dict):
         assert len(output["latents"]) == 2
@@ -189,7 +195,15 @@ def get_predictor_loss(model, labels, batch, t):
     else:
         # loss_dict["loss"] = torch.nn.BCELoss()(torch.nn.Sigmoid()(output), labels["gt"])
         # loss_dict["loss"] = F.cross_entropy(output, list(labels.values())[0], reduction="mean")'''
-    loss_dict["loss"] = F.cross_entropy(output, labels)
+    # loss_dict["loss"] = F.cross_entropy(output, labels)
+    loss_list = []
+    for attr in y.keys():
+        if attr == "digit":
+            loss_list.append(F.cross_entropy(output[attr], labels[attr]))
+        else:
+            loss_list.append(F.mse_loss(output[attr], labels[attr]))
+        
+    loss_dict["loss"] = sum(loss_list)
     return loss_dict
 
 
@@ -228,7 +242,6 @@ def split_microbatches(microbatch, *args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", help="mnist or brats", type=str)
-    parser.add_argument("--irm", action='store_true')
     args = parser.parse_args()
     print(args.dataset)
     main(args)

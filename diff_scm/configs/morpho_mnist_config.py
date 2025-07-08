@@ -9,16 +9,23 @@ import os
 def get_default_configs():
     config = ml_collections.ConfigDict()
 
-    config.dataset_name = "MNIST"
+    config.dataset_name = "MorphoMNIST"
     config.experiment_name = "exp_02_" + config.dataset_name
     
-    use_gpus = "0"  # e.g. "0,1,2"
+    use_gpus = "1"  # e.g. "0,1,2"
     os.environ["CUDA_VISIBLE_DEVICES"] = use_gpus
     # data
     config.data = data = ml_collections.ConfigDict()
+    data.attribute_size = {
+        "intensity": 1,
+        "thickness": 1,
+        "digit": 1 # TODO: was 10 but this is not being used
+    }
+    data.parents = ["intensity", "thickness", "digit"]
     data.path = Path("/store/nt9637/Diff-IRM/datasets") / config.dataset_name
+    data.normalize = True
     # experiment_path = r"../runs/"
-    experiment_path = Path("/store/nt9637/Diff-IRM/runs/")
+    config.experiment_path = "/store/nt9637/Diff-IRM/runs/"
     ## Diffusion parameters
     config.diffusion = diffusion = ml_collections.ConfigDict()
     diffusion.steps = 1000
@@ -33,11 +40,17 @@ def get_default_configs():
     diffusion.timestep_respacing = "ddim100"  
     diffusion.conditioning_noise = "constant"  
 
+    ## noisy encoder config
+    config.encoder = encoder = ml_collections.ConfigDict()
+    encoder.num_input_channels = 4 # num variables 
+    encoder.num_hidden_channels = 128
+    encoder.num_output_channels = 4 # num variables
+
     ## score model config
     config.score_model = score_model = ml_collections.ConfigDict()
     score_model.image_size = 28
-    score_model.classifier_free_cond = False
-    score_model.num_input_channels = 1
+    score_model.classifier_free_cond = True # TODO: try True
+    score_model.num_input_channels = 1 # Changed to 1
     score_model.num_channels = 32
     score_model.num_res_blocks = 1
     score_model.num_heads = 1
@@ -54,14 +67,15 @@ def get_default_configs():
 
     score_model.channel_mult = (1, 2, 2)
     score_model.dropout = 0.1
-    score_model.class_cond = False
+    score_model.class_cond = True # for unconditional training
     score_model.use_checkpoint = False
     score_model.use_scale_shift_norm = True
     score_model.resblock_updown = False
     score_model.use_fp16 = False
     score_model.use_new_attention_order = False
-    score_model.num_classes = 10
-    score_model.image_level_cond = False
+    score_model.num_classes = 3 # number of nodes in causal graph
+    score_model.image_level_cond = False # adds image as conditional
+    score_model.discrete_labels = False
 
     # score model training
     config.score_model.training = training_score = ml_collections.ConfigDict()
@@ -79,7 +93,12 @@ def get_default_configs():
     training_score.use_fp16 = score_model.use_fp16
     training_score.fp16_scale_growth = 1e-3
     training_score.conditioning_variable = "y"
-    training_score.cond_dropout_rate = 0.0
+    training_score.cond_dropout_rate = 0.1 # TODO: for unconditional training, try 0.1 (from Classifier-Free Diffusion Guidance paper)
+    training_score.unconditional_default = {
+        "intensity": 2, # this is normalized to [-1,1]
+        "thickness": 2, # this is normalized to [-1,1]
+        "digit": 10,
+    } # was num_classes, so 24?
 
     ## classifier config
 
@@ -90,24 +109,28 @@ def get_default_configs():
     classifier.classifier_width = 32
     classifier.classifier_depth = 1
     classifier.in_channels = score_model.num_input_channels
-    classifier.out_channels = [10]  # number of classes
+    classifier.out_channels = [12] # number of classes # TODO: was 12
     classifier.channel_mult = (1, 2, 4, 4)
     classifier.classifier_attention_resolutions = ""  # 16"32,16,8"
     classifier.classifier_use_scale_shift_norm = True  # False
     classifier.classifier_resblock_updown = True  # False
     classifier.classifier_pool =  "attention"
     classifier.classifier_use_fp16 = score_model.use_fp16
-    classifier.noise_conditioning = True
+    classifier.noise_conditioning = False # TODO: not used anywhere... set from True to False
     attention_ds = []
     if classifier.classifier_attention_resolutions != "":
         for res in classifier.classifier_attention_resolutions.split(","):
             attention_ds.append(classifier.image_size // int(res))
     classifier.attention_ds = tuple(attention_ds)
 
+    # TODO: for anti-parent classifier
+    classifier.cond_dropout_rate = training_score.cond_dropout_rate
+    classifier.unconditional_default = training_score.unconditional_default
+
     config.classifier.training = training_class = ml_collections.ConfigDict()
-    training_class.noised = True
+    training_class.noised = False
     training_class.adversarial_training = False
-    training_class.iterations = 3000
+    training_class.iterations = 100000
     training_class.lr = 1e-4
     training_class.weight_decay = 0.0
     training_class.anneal_lr = False
@@ -129,13 +152,22 @@ def get_default_configs():
     sampling.use_ddim = True
     sampling.reconstruction = True
     sampling.eta = 0.0
-    sampling.image_conditional = False
+    sampling.image_conditional = False # TODO not included anywhere
     sampling.label_of_intervention = "y" 
-    sampling.model_path = os.path.join(experiment_path, config.experiment_name, "/score_train/model003000.pt")
-    sampling.classifier_path = os.path.join(experiment_path, config.experiment_name,"/classifier_train_" + "_".join(config.classifier.label) + "/model001000.pt")
-    sampling.classifier_scale = 1.0
-    sampling.target_class = 5    
+    sampling.model_path_fn = lambda exp : os.path.join(config.experiment_path, config.experiment_name, "score_train", exp, "best_model.pt")
+    sampling.classifier_path_fn = lambda exp : os.path.join(config.experiment_path, config.experiment_name, "antiparent_classifier_train_" + "_".join(config.classifier.label), exp, "best_model.pt")
+    sampling.classifier_scale = 0.0 # TODO: change from 1.0 to 0.0
+    sampling.target_class_normalized = False
+    sampling.target_class = {
+        'intensity': None,
+        'thickness': None,
+        'digit': 0,
+    } 
+    sampling.unknown_parents = False # use anti-parent classifier
     sampling.sampling_progression_ratio = 0.75
+    sampling.norm_cond_scale = 3 # Tune # TODO was 3.0
+    sampling.beta = 0.1 # Look at ratio btw cond_eps and uncond_eps
+    sampling.expected_value_samples = 10
     config.seed = 42
     config.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 

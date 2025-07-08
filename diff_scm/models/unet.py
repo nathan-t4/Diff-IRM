@@ -13,6 +13,7 @@ from diff_scm.models.nn import avg_pool_nd, conv_nd, linear, normalization, time
 class AttentionPool2d(nn.Module):
     """
     Adapted from CLIP: https://github.com/openai/CLIP/blob/main/clip/model.py
+    TODO: deal with grid_dim
     """
 
     def __init__(
@@ -21,10 +22,13 @@ class AttentionPool2d(nn.Module):
             embed_dim: int,
             num_heads_channels: int,
             output_dim: int = None,
+            grid_dim: int = None,
     ):
         super().__init__()
+        print(spacial_dim, embed_dim, num_heads_channels, output_dim)
+        grid_dim = spacial_dim ** 2 + 1 if grid_dim is None else grid_dim + 1
         self.positional_embedding = nn.Parameter(
-            th.randn(embed_dim, spacial_dim ** 2 + 1) / embed_dim ** 0.5
+            th.randn(embed_dim, grid_dim) / embed_dim ** 0.5
         )
         self.qkv_proj = conv_nd(1, embed_dim, 3 * embed_dim, 1)
         self.c_proj = conv_nd(1, embed_dim, output_dim or embed_dim, 1)
@@ -35,6 +39,7 @@ class AttentionPool2d(nn.Module):
         b, c, *_spatial = x.shape
         x = x.reshape(b, c, -1)  # NC(HW)
         x = th.cat([x.mean(dim=-1, keepdim=True), x], dim=-1)  # NC(HW+1)
+        print(x.shape)
         x = x + self.positional_embedding[None, :, :].to(x.dtype)  # NC(HW+1)
         x = self.qkv_proj(x)
         x = self.attention(x)
@@ -364,6 +369,7 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         image_level_cond: bool = False,
+        discrete_labels: bool=False
     ):
         super().__init__()
 
@@ -385,6 +391,7 @@ class UNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.image_level_cond = image_level_cond
+        self.discrete_labels = discrete_labels
         
         time_embed_dim = model_channels * 4
         encoder_channels = time_embed_dim
@@ -399,10 +406,22 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             linear(time_embed_dim, time_embed_dim),
         )
-
+        
         if self.num_classes is not None:
-            self.label_emb = nn.Embedding(self.num_classes + 1, model_channels, padding_idx = -1)
-
+            if self.discrete_labels:
+                # For discrete labels
+                # first dim is number of labels, second is embedding dim
+                self.label_emb = nn.ModuleList(
+                    [nn.Embedding(self.num_classes + 1, model_channels, padding_idx = -1) 
+                    for _ in range(self.num_classes)])
+            else:
+                # For continuous labels
+                self.label_emb = nn.Sequential(
+                    linear(self.num_classes, model_channels),
+                    nn.SiLU(),
+                    linear(model_channels, model_channels),
+                )
+        
         ch = input_ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
             [TimestepEmbedSequential(conv_nd(dims, self.in_channels, ch, 3, padding=1))]
@@ -556,7 +575,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y = None, conditioning_x=None, **kwargs):
+    def forward(self, x, timesteps, y = None, conditioning_x=None, noise_embedding=None, **kwargs):
         """
         Apply the model to an input batch.
 
@@ -567,17 +586,21 @@ class UNetModel(nn.Module):
         """
         if (conditioning_x is not None) and self.image_level_cond:
             x = th.cat([x, conditioning_x], dim=1)
-
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
-
         if self.num_classes is not None:
-            class_embedding = self.class_embed(self.label_emb(y))
+            if noise_embedding is not None: # TODO
+                class_embedding = self.class_embed(self.label_emb(y) + noise_embedding)
+            else:
+                label_embedding = th.stack([self.label_emb[i](y[:,i]) for i in range(self.num_classes)], dim=1).sum(1) \
+                    if self.discrete_labels else self.label_emb(y)
+                class_embedding = self.class_embed(label_embedding)
             class_embedding_mm = th.einsum("ab,ac -> abc",class_embedding,class_embedding)
+    
             emb = emb + class_embedding
         else:
             class_embedding_mm = None
-
+        
         h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb, class_embedding_mm)
@@ -611,6 +634,7 @@ class EncoderUNetModel(nn.Module):
             dims=2,
             use_checkpoint=False,
             use_fp16=False,
+            num_classes=None,
             num_heads=1,
             num_head_channels=-1,
             num_heads_upsample=-1,
@@ -634,6 +658,7 @@ class EncoderUNetModel(nn.Module):
         self.conv_resample = conv_resample
         self.use_checkpoint = use_checkpoint
         self.dtype = th.float16 if use_fp16 else th.float32
+        self.num_classes = num_classes
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
@@ -646,6 +671,24 @@ class EncoderUNetModel(nn.Module):
             nn.SiLU(),
             linear(time_embed_dim, time_embed_dim),
         )
+
+        self.class_embed = nn.Sequential(
+            linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            linear(time_embed_dim, time_embed_dim),
+        )
+        
+        self.label_conditioning = False # TODO
+
+        if self.num_classes is not None:
+            if self.label_conditioning:
+                self.label_emb = nn.Embedding(self.num_classes + 1, model_channels, padding_idx = -1) 
+            else:
+                self.label_emb = nn.Sequential(
+                    linear(self.num_classes, model_channels),
+                    nn.SiLU(),
+                    linear(model_channels, model_channels),
+                )
 
         self.input_blocks = nn.ModuleList(
             [
@@ -750,9 +793,10 @@ class EncoderUNetModel(nn.Module):
             self.out = nn.Sequential(
                 normalization(ch),
                 nn.SiLU(),
-                AttentionPool2d(
-                    (image_size // ds), ch, num_head_channels, out_channels
+                AttentionPool2d( 
+                    (image_size // ds), ch, num_head_channels, out_channels,
                 ),
+                # TODO: why is grid_dim=16 for morpho_mnist ( 4 + 12 )?
             )
         elif pool == "spatial":
             self.out = nn.Sequential(
@@ -792,23 +836,31 @@ class EncoderUNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps):
+    def forward(self, x, timesteps, y = None):
         """
         Apply the model to an input batch.
 
         :param x: an [N x C x ...] Tensor of inputs.
         :param timesteps: a 1-D batch of timesteps.
+        :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x K] Tensor of outputs.
         """
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels)) if timesteps is not None else None
 
+        if self.num_classes is not None:
+            class_embedding = self.class_embed(self.label_emb(y))
+            class_embedding_mm = th.einsum("ab,ac -> abc",class_embedding,class_embedding)
+            emb = emb + class_embedding
+        else:
+            class_embedding_mm = None
+
         results = []
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb)
+            h = module(h, emb, class_embedding_mm)
             if self.pool.startswith("spatial"):
                 results.append(h.type(x.dtype).mean(dim=(2, 3)))
-        h = self.middle_block(h, emb)
+        h = self.middle_block(h, emb, class_embedding_mm)
         if self.pool.startswith("spatial"):
             results.append(h.type(x.dtype).mean(dim=(2, 3)))
             h = th.cat(results, axis=-1)
@@ -845,5 +897,38 @@ class AntiCausalMechanism(nn.Module):
             else:
                 raise Exception
             out[out_label] = anticausal_predictor(input_latent)
+        out["latents"] = latents
+        return out
+
+class ConditionalAntiParentMechanism(nn.Module):
+    def __init__(self, encoders: List[UNetModel], out_labels: List[str], out_channels: List[int],
+                 classifier_width: int = 128):
+        super().__init__()
+        assert isinstance(out_labels, List) and isinstance(out_channels, List) and isinstance(encoders, List)
+        assert len(out_labels) == len(out_channels) == len(encoders)
+        self.encoders = nn.ModuleList(encoders)
+        self.out_labels = out_labels
+        antiparent_predictors = []
+        for out_label, out_channel, encoder in zip(out_labels, out_channels, encoders):
+            antiparent_predictors.append(nn.Sequential(
+                nn.Linear(encoder.out_channels, classifier_width),
+                nn.ReLU(),
+                nn.Linear(classifier_width, out_channel),
+            ))
+        self.antiparent_predictors = nn.ModuleList(antiparent_predictors)
+
+    def forward(self, x, timesteps, y):
+        out = {}   
+        conditionals = th.cat([y[attr] for attr in y.keys()], dim=1)
+        latents = [enc(x, timesteps, conditionals) for enc in self.encoders]
+        for antiparent_predictor, out_label, latent in zip(self.antiparent_predictors, self.out_labels, latents):
+            out[out_label] = antiparent_predictor(latent)  
+        start_idx = 0
+        for attr in y.keys():
+            end_idx = start_idx + y[attr].shape[1]
+            out[attr] = out[out_label][:,start_idx:end_idx]
+            # if attr == "digit":
+                # out[attr] = F.softmax(out[attr], dim=1) # TODO: generalize
+            start_idx = end_idx
         out["latents"] = latents
         return out

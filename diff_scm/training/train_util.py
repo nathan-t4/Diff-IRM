@@ -11,6 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision
 from typing import Dict
 import matplotlib.pyplot as plt
+from copy import deepcopy
 
 from diff_scm.utils import dist_util, logger
 from diff_scm.utils.fp16_util import MixedPrecisionTrainer
@@ -200,14 +201,22 @@ class TrainLoop:
         self._anneal_lr()
         self.log_step()
 
-    def conditioning_dropout(self, model_conditionals: Dict):
+    def conditioning_dropout(self, model_conditionals: Dict, phase):
         '''         
         By setting the self.conditioning_variable to self.num_classes,
             we are telling the Embedding layer in the model to use non-class informative embedding (padding idx default to 0).
         '''
+        if phase != "train":
+            return model_conditionals
 
-        idx2drop = int(model_conditionals["y"].shape[0]*self.cond_dropout_rate)
-        model_conditionals["y"][th.randint(model_conditionals["y"].shape[0],(idx2drop,))] = self.model.num_classes
+        if isinstance(model_conditionals["y"], dict):
+            keys = list(model_conditionals["y"].keys())
+            for e in keys:
+                idx2drop = int(model_conditionals["y"][e].shape[0]*self.cond_dropout_rate)
+                model_conditionals["y"][e][th.randint(model_conditionals["y"][e].shape[0],(idx2drop,))] = self.model.num_classes
+        else:
+            idx2drop = int(model_conditionals["y"].shape[0]*self.cond_dropout_rate)
+            model_conditionals["y"][th.randint(model_conditionals["y"].shape[0],(idx2drop,))] = self.model.num_classes
         
         return model_conditionals
 
@@ -220,10 +229,11 @@ class TrainLoop:
         assert phase in ["train", "val"]
         if phase == "train":
             self.ddp_model.train()
-            if self.cond_dropout_rate != 0:
-                model_conditionals = self.conditioning_dropout(model_conditionals)
         else:
             self.ddp_model.eval()
+
+        if self.cond_dropout_rate != 0:
+            model_conditionals = self.conditioning_dropout(model_conditionals, phase)
         
         total_loss = 0.0
         self.mp_trainer.zero_grad()
@@ -287,9 +297,11 @@ class TrainLoop:
             if dist.get_rank() == 0:
                 logger.log(f"saving model {rate}...")
                 if not rate:
-                    filename = f"model{(self.step + self.resume_step):06d}.pt"
+                    # filename = f"model{(self.step + self.resume_step):06d}.pt"
+                    filename = "best_model.pt"
                 else:
-                    filename = f"ema_{rate}_{(self.step + self.resume_step):06d}.pt"
+                    # filename = f"ema_{rate}_{(self.step + self.resume_step):06d}.pt"
+                    filename = f"best_ema_{rate}.pt"
                 with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
                     th.save(state_dict, f)
 
@@ -299,7 +311,8 @@ class TrainLoop:
 
         if dist.get_rank() == 0:
             with bf.BlobFile(
-                    bf.join(get_blob_logdir(), f"opt{(self.step + self.resume_step):06d}.pt"),
+                    # bf.join(get_blob_logdir(), f"opt{(self.step + self.resume_step):06d}.pt"),
+                    bf.join(get_blob_logdir(), f"best_opt.pt"),
                     "wb",
             ) as f:
                 th.save(self.opt.state_dict(), f)
@@ -333,7 +346,7 @@ class IRMTrainLoop(TrainLoop):
     ):
         self.model = model
         self.diffusion = diffusion
-        self.data = data # TODO: Need to change
+        self.data = data
         self.data_val = data_val
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
@@ -424,31 +437,240 @@ class IRMTrainLoop(TrainLoop):
         for i in range(0, batch_size, self.microbatch):
             micro = {env : batch[env][i: i + self.microbatch].to(dist_util.dev()) for env in batch.keys() }
             micro_cond = {
-                k : { env : v[env][i: i + self.microbatch].to(dist_util.dev()) for env in batch.keys() }
-                for k, v in model_conditionals.items()
+                env : { k : v[env][i: i + self.microbatch].to(dist_util.dev()) for k, v in model_conditionals.items() }
+                for env in batch.keys()
             }
             last_batch = (i + self.microbatch) >= batch_size
             microbatch_size = min([micro[env].shape[0] for env in micro.keys()])
             t, weights = self.schedule_sampler.sample(microbatch_size, dist_util.dev())
 
             # micro[env] has shape is 100 3 28 28
-            compute_losses = [functools.partial(
+            compute_losses = lambda image, image_cond : [functools.partial(
                 self.diffusion.training_losses,
                 self.ddp_model,
-                micro[env],
+                image[env],
                 t,
-                model_kwargs=micro_cond
+                model_kwargs=image_cond[env],
             ) for env in micro.keys()]
 
-            # TODO:
-            irm_objective = add_dicts([loss() for loss in compute_losses])
+            batch_losses = add_dicts([loss() for loss in compute_losses(micro, micro_cond)])
 
             if last_batch or not self.use_ddp:
-                # IRM objective
-                losses = irm_objective
+                losses = batch_losses
             else:
                 with self.ddp_model.no_sync():
-                    losses = irm_objective
+                    losses = batch_losses
+
+            if isinstance(self.schedule_sampler, LossAwareSampler):
+                self.schedule_sampler.update_with_local_losses(
+                    t, losses["loss"].detach()
+                )
+
+            loss = (losses["loss"] * weights).mean()
+            # Calculate IRM gradient loss
+            scale = th.ones(micro[next(iter(micro))].shape, requires_grad=True).to(dist_util.dev())
+            scaled_micro = {k : scale * v[k] for (k,v) in micro.items()}
+            irm_losses = add_dicts([loss() for loss in compute_losses(scaled_micro, micro_cond)])
+            irm_loss = (irm_losses["mse"] * weights).mean()
+            grad = th.autograd.grad(irm_loss, [scale], create_graph=True)[0]
+            irm_loss = th.sum(grad ** 2)
+
+            loss = loss + 1e5 * irm_loss # TODO: change scale?
+
+            log_loss_dict(
+                self.diffusion, t, {phase + '_' + k: v * weights for k, v in losses.items()}
+            )
+            if phase == "train":
+                self.mp_trainer.backward(loss)            
+            total_loss += loss
+        
+        return total_loss.detach()
+    
+class MultiTrainLoop(TrainLoop):
+    def __init__(
+            self,
+            *,
+            model,
+            noise_encoder,
+            diffusion,
+            data,
+            data_val,
+            batch_size,
+            microbatch,
+            lr,
+            ema_rate,
+            log_interval,
+            save_interval,
+            resume_checkpoint,
+            use_fp16=False,
+            fp16_scale_growth=1e-3,
+            schedule_sampler=None,
+            weight_decay=0.0,
+            lr_anneal_steps=0,
+            main_data_identifier: str = "image",
+            cond_dropout_rate: float = 0.0,
+            conditioning_variable: str = "y",
+            unconditional_default: dict = None,
+            parents: list = None,
+            iterations: int = 70e3,
+    ):
+        self.model = model
+        self.noise_encoder = noise_encoder
+        self.diffusion = diffusion
+        self.data = data
+        self.data_val = data_val
+        self.batch_size = batch_size
+        self.microbatch = microbatch if microbatch > 0 else batch_size
+        self.lr = lr
+        self.ema_rate = (
+            [ema_rate]
+            if isinstance(ema_rate, float)
+            else [float(x) for x in ema_rate.split(",")]
+        )
+        self.log_interval = log_interval
+        self.save_interval = save_interval
+        self.resume_checkpoint = resume_checkpoint
+        self.use_fp16 = use_fp16
+        self.fp16_scale_growth = fp16_scale_growth
+        self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
+        self.weight_decay = weight_decay
+        self.lr_anneal_steps = lr_anneal_steps
+        self.main_data_identifier = main_data_identifier
+        self.conditioning_variable = conditioning_variable
+        self.cond_dropout_rate = cond_dropout_rate
+        self.unconditional_default = unconditional_default
+        self.parents = parents
+        self.iterations = iterations
+
+        # self.writer = SummaryWriter(logger.get_current() / 'tensorboard')
+        self.step = 0
+        self.resume_step = 0
+        self.global_batch = self.batch_size * dist.get_world_size()
+
+        self.sync_cuda = th.cuda.is_available()
+
+        self._load_and_sync_parameters()
+        self.mp_trainer = MixedPrecisionTrainer(
+            model=self.model,
+            use_fp16=self.use_fp16,
+            fp16_scale_growth=fp16_scale_growth,
+        )
+
+        self.opt = AdamW(
+            self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
+        )
+        if self.resume_step:
+            self._load_optimizer_state()
+            # Model was resumed, either due to a restart or a checkpoint
+            # being specified at the command line.
+            self.ema_params = [
+                self._load_ema_parameters(rate) for rate in self.ema_rate
+            ]
+        else:
+            self.ema_params = [
+                copy.deepcopy(self.mp_trainer.master_params)
+                for _ in range(len(self.ema_rate))
+            ]
+
+        if th.cuda.is_available():
+            self.use_ddp = True
+            self.ddp_model = DDP(
+                self.model,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=True,
+            )
+        else:
+            if dist.get_world_size() > 1:
+                logger.warn(
+                    "Distributed training requires CUDA. "
+                    "Gradients will not be synchronized properly!"
+                )
+            self.use_ddp = False
+            self.ddp_model = self.model
+    
+    def conditioning_dropout(self, model_conditionals: Dict, phase):
+        '''         
+        By setting the self.conditioning_variable to self.num_classes,
+            we are telling the Embedding layer in the model to use non-class informative embedding (padding idx default to 0).
+        '''
+        model_conditionals_copy = deepcopy(model_conditionals)
+        conditionals = []
+        defaults = self.unconditional_default
+        interventions = list(model_conditionals.keys())
+        interventions.remove("attrs")
+
+        # TODO: model_conditionals["u"] = g(x_0) initial noise
+        
+        # Remove parents from intervention targets
+        for att in self.parents:
+            interventions.remove(att)
+        
+        # Add intervention targest (excluding parents)
+        for att in interventions:
+            idx2drop = int(model_conditionals[att].shape[0]*self.cond_dropout_rate)
+            if phase == "train": 
+                model_conditionals[att][th.randint(model_conditionals[att].shape[0],(idx2drop,))] = defaults[att]
+            conditional = model_conditionals[att] if len(model_conditionals[att].shape) == 2 else model_conditionals[att].unsqueeze(1)
+            conditionals.append(conditional)
+        # Add parents
+        for att in self.parents:
+            idx2drop = int(model_conditionals_copy[att].shape[0]*self.cond_dropout_rate)
+            if phase == "train": 
+                model_conditionals_copy[att][th.randint(model_conditionals_copy[att].shape[0],(idx2drop,))] = defaults[att]
+            parent = model_conditionals_copy[att] if len(model_conditionals_copy[att].shape) == 2 else model_conditionals_copy[att].unsqueeze(1)
+            conditionals.append(parent)
+
+        
+        # This is the intervention targets (z) and the output's parents (w = pa(x))
+        model_conditionals["y"] = th.cat(conditionals, dim=1)
+        return model_conditionals
+
+    def forward_backward(self, data_dict, phase: str = "train"):
+        
+        # self.main_data_identifier = "image"
+        batch = data_dict.pop(self.main_data_identifier)
+        model_conditionals = data_dict
+
+        assert phase in ["train", "val"]
+        if phase == "train":
+            self.ddp_model.train()
+        else:
+            self.ddp_model.eval()
+
+        if self.cond_dropout_rate != 0:
+            model_conditionals = self.conditioning_dropout(model_conditionals, phase)
+        
+        total_loss = 0.0
+        self.mp_trainer.zero_grad()
+        for i in range(0, batch.shape[0], self.microbatch):
+            micro = batch[i: i + self.microbatch].to(dist_util.dev())
+            micro_cond = {
+                k: v[i: i + self.microbatch].to(dist_util.dev())
+                for k, v in model_conditionals.items()
+            }
+            last_batch = (i + self.microbatch) >= batch.shape[0]
+            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+
+            # TODO add noise?
+            # noise = self.noise_encoder(micro)
+            # model_conditionals["y"] = th.cat([noise, model_conditionals["y"]], dim=1)
+
+            compute_losses = functools.partial(
+                self.diffusion.training_losses,
+                self.ddp_model,
+                micro,
+                t,
+                model_kwargs=micro_cond
+            )
+
+            if last_batch or not self.use_ddp:
+                losses = compute_losses()
+            else:
+                with self.ddp_model.no_sync():
+                    losses = compute_losses()
 
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(
@@ -463,7 +685,6 @@ class IRMTrainLoop(TrainLoop):
                 self.mp_trainer.backward(loss)
             
             total_loss += loss
-        
         return total_loss.detach()
 
 def add_dicts(dicts: list):

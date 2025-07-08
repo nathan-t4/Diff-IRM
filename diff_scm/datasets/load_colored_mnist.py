@@ -3,6 +3,9 @@ from torch.utils.data import Dataset
 import torchvision
 
 class colored_MNIST_dataset(Dataset):
+    """
+        Same train/test split as IRM paper
+    """
     def __init__(self, root_dir, train: bool = True, irm: bool = True):
         dataset = torchvision.datasets.MNIST(root=root_dir, train=train, download=True)
         ## From training set
@@ -10,8 +13,9 @@ class colored_MNIST_dataset(Dataset):
         # self.images = torch.einsum("bwh -> bhw", self.images)
         self.labels = torch.as_tensor(dataset.targets, dtype=torch.long)
         self.irm = irm
-
         if train:
+            self.images = self.images[:8000]
+            self.labels = self.labels[:8000]
             env1 = self._create_environment(self.images[::2], self.labels[::2], 0.2)
             env2 = self._create_environment(self.images[1::2], self.labels[1::2], 0.1)
             
@@ -28,10 +32,11 @@ class colored_MNIST_dataset(Dataset):
                 self.labels = torch.concatenate((self.labels[::2], self.labels[1::2]), dim=0)
                 self.length = self.images.shape[0]
         else:
-            env = self._create_environment(dataset.images, dataset.labels, 0.9)
+            self.images = self.images[8000:]
+            self.labels = self.labels[8000:]
+            env = self._create_environment(self.images, self.labels, 0.9) # changed from 0.9 to 0.15
 
             self.images = env['images']
-            self.labels = env['labels']
             self.length = self.images.shape[0]
         
         assert len(self.images) == len(self.labels)
@@ -50,10 +55,10 @@ class colored_MNIST_dataset(Dataset):
         zeros = torch.zeros(images.shape)
         images = torch.stack([images, images, zeros], dim=-1) # rgb
         # flip to red or green based on colors
-        images[torch.tensor(range(len(images))), :, :, (1-colors).long()] *= 0
+        images[torch.tensor(range(len(images))), :, :, (1-colors).long()] *= 0 # batch_size, width, height, (rgb)
         
         return {
-            'images': images.float().clip(0, 255),
+            'images': images.float().clip(0, 1),
             'labels': labels[:, None]
         }
 
@@ -62,7 +67,7 @@ class colored_MNIST_dataset(Dataset):
 
     def __getitem__(self, idx):
         item = {}
-        if self.irm:
+        if isinstance(self.images, dict):
             item['image'] = { env : self.images[env][idx].transpose(0,2) for env in self.images.keys() }
             item['y'] = { env : self.labels[env][idx] for env in self.labels.keys() }
         else:

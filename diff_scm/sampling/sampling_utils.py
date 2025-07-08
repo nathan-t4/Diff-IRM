@@ -83,6 +83,7 @@ def get_models_functions(config, model, anti_causal_predictor):
         half_eps = uncond_eps + config.sampling.norm_cond_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return eps
+    
     # classifier-free guidance without increasing batch - trading off space for time
     def model_classifier_free_opt_fn(x_t, ts, **kwargs):
         ## conditional diffusion output
@@ -112,7 +113,6 @@ def get_models_functions(config, model, anti_causal_predictor):
         return torch.min(torch.max(x,-quantile_broadcasted), quantile_broadcasted) / quantile_broadcasted
 
     return cond_fn, model_fn, model_classifier_free_opt_fn, clamp_to_spatial_quantile
-
 
 
 def get_dict_of_arrays(all_results):
